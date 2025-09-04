@@ -1,0 +1,155 @@
+'''
+Preference / Reward model 
+Here it learns to reward the 
+
+** Dataset ** 
+
+Prompt : Why is the color of sky blue ?
+Chosen : Its because of the scattering of blue wavelength by air molecules 
+Rejected : Because sky likes blue color
+
+
+The reward model, is a linear layer at top, that learn to output whether this response is good or not 
+
+Input1 to model : {Prompt + Chosen} ,  Output1 : 1  
+Input2 to model : {Prompt + Rejected}  , Output2: 0 
+
+
+Here the model learns to pick up a good response !
+'''
+
+
+
+# Single runnable cell — minimal, targeted fixes only (copy-paste)
+import os
+import torch
+import torch.nn as nn
+from datasets import load_dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    AutoConfig,
+    PreTrainedModel,
+)
+from transformers.modeling_outputs import SequenceClassifierOutput
+from trl import RewardConfig, RewardTrainer
+
+# ------------------ USER-CHOICE (preserved) ------------------
+BASE_MODEL = "google/gemma-3-270m-it"
+FILE_PATH = os.path.dirname(os.path.dirname(__file__))
+# keep your FILE_PATH variable as-is in your environment
+# if it's not defined, set a sensible default (uncomment next line)
+# FILE_PATH = "./models"
+# -------------------------------------------------------------
+
+# 1) tokenizer (used by RewardTrainer as processing_class)
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, cache_dir=FILE_PATH)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+# 2) ConvertedModel: PreTrainedModel wrapper that uses frozen causal LM backbone
+class ConvertedModel(PreTrainedModel):
+    def __init__(self, config, **kwargs):
+        super().__init__(config)
+        # preserve your supplied model name if provided; else fall back to config
+        self.model_name = kwargs.get("model", getattr(config, "name_or_path", BASE_MODEL))
+        # reward head => single scalar
+        self.num_labels = kwargs.get("num_labels", getattr(config, "num_labels", 1))
+
+        # load frozen LM backbone
+        self.lm_model = AutoModelForCausalLM.from_pretrained(self.model_name, cache_dir=FILE_PATH)
+        for p in self.lm_model.parameters():
+            p.requires_grad = False
+
+        # replace lm_head with scalar reward head — do NOT pass device here
+        in_features = self.lm_model.lm_head.in_features
+        self.lm_model.lm_head = nn.Linear(in_features, 1)
+        self.classifier = self.lm_model.lm_head
+        for p in self.classifier.parameters():
+            p.requires_grad = True
+
+    def forward(self, input_ids=None, attention_mask=None, return_dict: bool = True, **kwargs):
+        # pass through LM body
+        lm_out = self.lm_model.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        last_hidden = lm_out.last_hidden_state        # [B, L, H]
+        pooled = last_hidden[:, -1, :]                # last token pooling -> [B, H]
+        rewards = self.classifier(pooled)             # [B, 1]
+        if not return_dict:
+            return (rewards,)
+        return SequenceClassifierOutput(logits=rewards)
+
+    # lightweight saving: store only head weights (as you requested earlier)
+    def save_pretrained(self, save_directory, **kwargs):
+        os.makedirs(save_directory, exist_ok=True)
+        torch.save(self.classifier.state_dict(), os.path.join(save_directory, "lm_head.pt"))
+
+# 3) build model from config and move to device (CPU by default)
+config = AutoConfig.from_pretrained(BASE_MODEL, num_labels=1, cache_dir=FILE_PATH)
+conv_model = ConvertedModel(config, model=BASE_MODEL, num_labels=1)
+
+device = torch.device("mps")  # change to "cuda" if you have CUDA and want to use it
+conv_model.to(device)
+
+# 4) load raw preference dataset (let RewardTrainer handle tokenization)
+dataset = load_dataset("Dahoas/rm-static", cache_dir=FILE_PATH)
+
+# 5) reward/trainer args (keeps your preferences)
+reward_args = RewardConfig(
+    output_dir=os.path.join(FILE_PATH, "reward_outputs"),
+    logging_dir=os.path.join(FILE_PATH, "logs"),
+    do_train=True,
+    do_eval=True,
+    per_device_train_batch_size=32,
+    num_train_epochs=10,
+    logging_steps=20,
+    gradient_checkpointing=False,
+    learning_rate=1e-5,
+    max_grad_norm=1.0,
+    fp16=False,
+    bf16=False,
+    save_strategy="steps",
+    save_steps=5,
+    save_total_limit=2,
+    report_to=['wandb'],   # no live wandb streaming
+    run_name="reward_model_gemma_linear_head",
+    max_length=512,
+    dataset_num_proc=1,
+)
+
+# 6) sanity check: forward with tokenizer on a single example (ensure finite logits)
+conv_model.eval()
+sample = dataset["train"][0]
+# create one prompt+response string (prompt+chosen) to check tokenization + forward
+chosen_text = sample["prompt"] + " " + sample["chosen"]
+tok = tokenizer(chosen_text, truncation=True, padding="max_length", max_length=512, return_tensors="pt")
+inp_ids = tok["input_ids"].to(device)
+attn = tok["attention_mask"].to(device)
+with torch.no_grad():
+    out = conv_model(input_ids=inp_ids, attention_mask=attn, return_dict=True).logits
+print("Sanity check logits shape:", out.shape, "finite:", torch.isfinite(out).all().item())
+
+# If logits are not finite, reinitialize head and re-run sanity check
+if not torch.isfinite(out).all().item():
+    print("Reinitializing head (non-finite detected).")
+    in_f = conv_model.classifier.in_features
+    conv_model.classifier = nn.Linear(in_f, 1)
+    nn.init.normal_(conv_model.classifier.weight, std=0.02)
+    nn.init.zeros_(conv_model.classifier.bias)
+    for p in conv_model.classifier.parameters(): p.requires_grad = True
+    conv_model.to(device)
+    with torch.no_grad():
+        out = conv_model(input_ids=inp_ids, attention_mask=attn, return_dict=True).logits
+    print("After reinit finite:", torch.isfinite(out).all().item())
+
+# 7) instantiate RewardTrainer and run training (let TRL do tokenization)
+trainer = RewardTrainer(
+    model=conv_model,
+    processing_class=tokenizer,   # let TRL create input_ids_chosen / input_ids_rejected
+    args=reward_args,
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["test"],
+)
+
+print("Starting training — trainer.train() ...")
+trainer.train()

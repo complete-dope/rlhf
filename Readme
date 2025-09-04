@@ -1,0 +1,33 @@
+
+
+Model Used: gemini/gemma-270M model 
+
+
+
+Training a reward model, the pretrained + SFT done model ( gemini/gemini-270M ) on top of that now we need to train a layer model telling what a good response looks like and what is a bad response looks like !
+
+
+
+Hugging face model types : 
+AutoModel for causalLM : This is just normal causal( autoregressive ) language model 
+
+AutoModel for Sequence Classification : Adds a linear layer at top of a model and uses it for classification tasks ! 
+
+
+In Usual conventions we have, causal LM as an actor / agent the one that we are trying to improve and the Sequence classification model as the one that is a critic / reward model , the one that tells / criticizes the output   
+
+
+> Python env not found in jupyter , just install `python -m pip install jupyter` extension in the same env   
+
+Convert the causal LM model to sequence classfication model !! 
+
+### Important point : 
+As of 3rd sept 2025, I didnt found any repo that can convert a casualLM model to Sequence Classification model and output it so we will be writing our own !! 
+
+Tried few : https://github.com/RLHFlow/RLHF-Reward-Modeling/blob/main/bradley-terry-rm/gemma_2B_rm.py but they are using the official images or community images not the one that we can actually use it out !! 
+
+### Convert from causal LM to seq classifier first lets see the difference between the archs!!
+
+AutoConfig: tells us the model creators actually used all these values in training the model, they only published this config 
+
+we have a  `training.py` script that basically train a reward model for our PPO  

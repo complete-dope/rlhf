@@ -1,0 +1,23 @@
+# Ignore lock files
+*.lock
+/.locks/
+
+# Ignore Hugging Face models
+**/models--*
+
+# Ignore datasets
+/Dahoas___rm-static/
+
+# Ignore Python virtual environment
+/.venv/
+
+*.safetensors
+*.jinja
+*.pt 
+*.bin
+
+/reward_outputs
+*.pyc
+*.log
+**/wandb
+
