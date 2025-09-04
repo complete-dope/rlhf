@@ -31,3 +31,5 @@ Tried few : https://github.com/RLHFlow/RLHF-Reward-Modeling/blob/main/bradley-te
 AutoConfig: tells us the model creators actually used all these values in training the model, they only published this config 
 
 we have a  `training.py` script that basically train a reward model for our PPO  
+
+

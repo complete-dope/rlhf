@@ -16,6 +16,8 @@ Input2 to model : {Prompt + Rejected}  , Output2: 0
 
 
 Here the model learns to pick up a good response !
+
+This is the logic that happens in PPO loop ! So there is nothing as seperate training for a PPO model directly just use this as a Value head  
 '''
 
 
@@ -32,7 +34,9 @@ from transformers import (
     PreTrainedModel,
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
-from trl import RewardConfig, RewardTrainer
+from trl import RewardConfig, RewardTrainer, PreTrainedModelWrapper
+from dotenv import load_dotenv
+load_dotenv()
 
 # ------------------ USER-CHOICE (preserved) ------------------
 BASE_MODEL = "google/gemma-3-270m-it"
@@ -48,8 +52,46 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
 
+# Reward model (Trained model )
+class RewardModel(PreTrainedModel):
+    def __init__(self, config, **kwargs):
+        super().__init__(config)
+        # preserve your supplied model name if provided; else fall back to config
+        self.model_name = kwargs.get("model", getattr(config, "name_or_path", BASE_MODEL))
+        # reward head => single scalar
+        self.num_labels = kwargs.get("num_labels", getattr(config, "num_labels", 1))
+
+        # load frozen LM backbone
+        self.lm_model = AutoModelForCausalLM.from_pretrained(self.model_name, cache_dir=FILE_PATH)
+        for p in self.lm_model.parameters():
+            p.requires_grad = False
+
+        # replace lm_head with scalar reward head — do NOT pass device here
+        in_features = self.lm_model.lm_head.in_features
+        self.lm_model.lm_head = nn.Linear(in_features, 1)
+        self.classifier = self.lm_model.lm_head
+        for p in self.classifier.parameters():
+            p.requires_grad = True
+
+    def forward(self, input_ids=None, attention_mask=None, return_dict: bool = True, **kwargs):
+        # pass through LM body
+        lm_out = self.lm_model.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        last_hidden = lm_out.last_hidden_state        # [B, L, H]
+        pooled = last_hidden[:, -1, :]                # last token pooling -> [B, H]
+        rewards = self.classifier(pooled)             # [B, 1]
+        if not return_dict:
+            return (rewards,)
+        return SequenceClassifierOutput(logits=rewards)
+
+    # lightweight saving: store only head weights (as you requested earlier)
+    def save_pretrained(self, save_directory, **kwargs):
+        os.makedirs(save_directory, exist_ok=True)
+        torch.save(self.classifier.state_dict(), os.path.join(save_directory, "lm_head.pt"))
+
+
 # 2) ConvertedModel: PreTrainedModel wrapper that uses frozen causal LM backbone
-class ConvertedModel(PreTrainedModel):
+# PPO trainer : https://huggingface.co/docs/trl/main/en/trainer#trl.PPOTrainer
+class ValueModel(PreTrainedModelWrapper):
     def __init__(self, config, **kwargs):
         super().__init__(config)
         # preserve your supplied model name if provided; else fall back to config
@@ -86,7 +128,15 @@ class ConvertedModel(PreTrainedModel):
 
 # 3) build model from config and move to device (CPU by default)
 config = AutoConfig.from_pretrained(BASE_MODEL, num_labels=1, cache_dir=FILE_PATH)
-conv_model = ConvertedModel(config, model=BASE_MODEL, num_labels=1)
+print('the config is : ', config)
+conv_model = RewardModel(config, model=BASE_MODEL, num_labels=1)
+
+print('Initializing the value model below this !!')
+value_model= ValueModel(config , model = BASE_MODEL , num_labels=1) 
+
+
+import sys
+sys.exit(0)
 
 device = torch.device("mps")  # change to "cuda" if you have CUDA and want to use it
 conv_model.to(device)
@@ -153,3 +203,18 @@ trainer = RewardTrainer(
 
 print("Starting training — trainer.train() ...")
 trainer.train()
+
+
+
+
+'''
+Training our own reward model, changing the loss function , optim, and getting a feel of it .. lets do that part ! ! 
+
+'''
+
+
+
+
+
+
+
